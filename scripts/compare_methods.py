@@ -2,6 +2,7 @@
 
 # Python imports
 import os
+import json
 import numpy as np
 from tqdm import tqdm
 from argparse import ArgumentParser
@@ -166,18 +167,27 @@ def compute_fixed_loci(R, P_monoms, srideal, invol):
     # Compare each monomial instead of the full polynomial,
     # so that coefficients remain arbitrary
     P_diff = [x - x.subs(X_sub) for x in P_monoms]
-    P_diff_ideal = R.ideal(*P_diff).radical()  # P_i = \sigma(P_i)
-    P_monoms_ideal = R.ideal(*P_monoms).radical()  # P_i = 0
-    fixed_loci = []
-    for loc in P_diff_ideal.minimal_associated_primes():
-        # Union of ideals == intersection of varieties
-        P_loc = P_monoms_ideal + loc
-        for s in srideal:
-            # Quotient of ideals == set difference of varieties
-            if P_loc.quotient(s).dimension() < 0:  # total ring
-                break
-        else:
-            fixed_loci.append(loc)
+#     P_diff_ideal = R.ideal(*P_diff).radical()  # P_i = \sigma(P_i)
+#     P_monoms_ideal = R.ideal(*P_monoms).radical()  # P_i = 0
+#     fixed_loci = []
+#     for loc in P_diff_ideal.minimal_associated_primes():
+#         # Union of ideals == intersection of varieties
+#         P_loc = P_monoms_ideal + loc
+#         for s in srideal:
+#             # Quotient of ideals == set difference of varieties
+#             if P_loc.quotient(s).dimension() < 0:  # total ring
+#                 break
+#         else:
+#             fixed_loci.append(loc)
+#     return fixed_loci
+    hysurf_diff_ideal = R.ideal(*P_diff).radical()
+    # The intersection of ideals == union of varieties
+    # This ideal sweeps out all points that must be removed from the ambient space
+    srideal_intersection = MPolynomialIdeal.intersection(*srideal).radical()
+    # Quotient of ideals == set difference of varieties
+    # Remove points in the SR ideal from the fixed loci
+    hysurf_diff_ideal = hysurf_diff_ideal.quotient(srideal_intersection)
+    fixed_loci = hysurf_diff_ideal.minimal_associated_primes()
     return fixed_loci
 
 
@@ -185,7 +195,7 @@ def compute_odim(ideal):
     """Compute the orientifold plane dimension of an ideal"""
     codim = ideal.dimension()
     dim = ideal.ring().krull_dimension() - codim
-    return 3 + 2 * (3 - dim)
+    return int(3 + 2 * (3 - dim))
 
 
 def compute_volformparity(rescws, invol):
@@ -245,7 +255,7 @@ def compute_all(doc):
     curr_oplanes = [{'ODIM': compute_odim(x), 'OIDEAL': [str(x) for x in sorted(x.gens())]} for x in curr_fixed_loci]
     oplanes = {'prev': sorted(prev_oplanes, key=lambda x: x['OIDEAL']), 'curr': sorted(curr_oplanes, key=lambda x: x['OIDEAL'])}
     
-    prev_volformparity = volformparity
+    prev_volformparity = int(volformparity)
     curr_volformparity = compute_volformparity(rescws, invol)
     volformparity = {'prev': prev_volformparity, 'curr': curr_volformparity}
     
@@ -319,4 +329,4 @@ if __name__ == '__main__':
         for doc in tqdm(db.full_join(args.query), total=db.count(args.query)):
             doc = format_inputs(doc)
             result = compute_all(doc)
-            print(result)
+            print(json.dumps(result))
