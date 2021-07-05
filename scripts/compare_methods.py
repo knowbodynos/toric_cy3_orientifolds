@@ -3,6 +3,7 @@
 # Python imports
 import os
 import numpy as np
+from tqdm import tqdm
 from argparse import ArgumentParser
 from itertools import permutations, combinations
 from sympy.combinatorics.permutations import Permutation
@@ -26,17 +27,34 @@ class ToricCY(Database):
     
     def sample_join(self, query):
         sample = self.INVOL.aggregate([{'$match': query}, {'$sample': {'size': 1}}])
-        result = next(sample)
-        result.update(
-            self.TRIANG.find_one({k: result[k] for k in ["POLYID", "GEOMN", "TRIANGN"]})
+        doc = next(sample)
+        doc.update(
+            self.TRIANG.find_one({k: doc[k] for k in ["POLYID", "GEOMN", "TRIANGN"]})
         )
-        result.update(
-            self.GEOM.find_one({k: result[k] for k in ["POLYID", "GEOMN"]})
+        doc.update(
+            self.GEOM.find_one({k: doc[k] for k in ["POLYID", "GEOMN"]})
         )
-        result.update(
-            self.POLY.find_one({"POLYID": result["POLYID"]})
+        doc.update(
+            self.POLY.find_one({"POLYID": doc["POLYID"]})
         )
-        return result
+        return doc
+    
+    def full_join(self, query):
+        full = self.INVOL.find(query)
+        for doc in full:
+            doc.update(
+                self.TRIANG.find_one({k: doc[k] for k in ["POLYID", "GEOMN", "TRIANGN"]})
+            )
+            doc.update(
+                self.GEOM.find_one({k: doc[k] for k in ["POLYID", "GEOMN"]})
+            )
+            doc.update(
+                self.POLY.find_one({"POLYID": doc["POLYID"]})
+            )
+            yield doc
+
+    def count(self, query):
+        return self.INVOL.find(query).count()
 
 
 def format_matrix(mat):
@@ -56,6 +74,19 @@ def format_invol(invol, k):
             pairs.append(pair)
     perm = Permutation(range(k)) * Permutation(pairs)
     return perm
+
+
+def format_inputs(doc):
+    """Reformat database records to numpy"""
+    doc['NVERTS'] = format_matrix(doc['NVERTS'])
+    doc['DRESVERTS'] = format_matrix(doc['DRESVERTS'])
+    doc['RESCWS'] = format_matrix(doc['RESCWS'])
+    doc['TRIANG'] = format_matrix(doc['TRIANG'])
+    
+    k, n = doc['DRESVERTS'].shape
+    doc['INVOL'] = format_invol(doc['INVOL'], k)
+    
+    return doc
 
 
 def format_srideal(prev_R, curr_R, srideal):
@@ -135,14 +166,18 @@ def compute_fixed_loci(R, P_monoms, srideal, invol):
     # Compare each monomial instead of the full polynomial,
     # so that coefficients remain arbitrary
     P_diff = [x - x.subs(X_sub) for x in P_monoms]
-    hysurf_diff_ideal = R.ideal(*P_diff).radical()
-    # The intersection of ideals == union of varieties
-    # This ideal sweeps out all points that must be removed from the ambient space
-    srideal_intersection = MPolynomialIdeal.intersection(*srideal).radical()
-    # Quotient of ideals == set difference of varieties
-    # Remove points in the SR ideal from the fixed loci
-    hysurf_diff_ideal = hysurf_diff_ideal.quotient(srideal_intersection)
-    fixed_loci = hysurf_diff_ideal.minimal_associated_primes()
+    P_diff_ideal = R.ideal(*P_diff).radical()  # P_i = \sigma(P_i)
+    P_monoms_ideal = R.ideal(*P_monoms).radical()  # P_i = 0
+    fixed_loci = []
+    for loc in P_diff_ideal.minimal_associated_primes():
+        # Union of ideals == intersection of varieties
+        P_loc = P_monoms_ideal + loc
+        for s in srideal:
+            # Quotient of ideals == set difference of varieties
+            if P_loc.quotient(s).dimension() < 0:  # total ring
+                break
+        else:
+            fixed_loci.append(loc)
     return fixed_loci
 
 
@@ -153,16 +188,96 @@ def compute_odim(ideal):
     return 3 + 2 * (3 - dim)
 
 
+def compute_volformparity(rescws, invol):
+    k, m = rescws.shape
+    n = k - m
+    vform = np.empty(0)
+    vform_invol = np.empty(0)
+    for c in combinations(range(k), n):
+        term = 0
+        term_invol = 0
+        nc = tuple(set(range(k)) - set(c))
+        for p in permutations(nc, k - n):
+            p_c = Permutation(p + c)
+            term += p_c.signature() * rescws[p, range(k - n)].prod()
+            term_invol += (invol * p_c).signature() * rescws[invol.array_form][p, range(k - n)].prod()
+        vform = np.append(vform, [term])
+        vform_invol = np.append(vform_invol, [term_invol])
+    if (vform == vform_invol).all():
+        return 1
+    elif (vform == -vform_invol).all():
+        return -1
+    else:
+        return 0
+
+    
+def compute_smoothness(R, P_monoms, fixed_loci, srideal):
+    srideal_intersect = MPolynomialIdeal.intersection(*srideal)
+    J_P_monoms = [x.jacobian_ideal() for x in P_monoms]
+    trans_ideal = R.ideal(*P_monoms) + sum(J_P_monoms) + sum(fixed_loci)
+    trans_ideal = trans_ideal.radical().quotient(srideal_intersect)
+    return trans_ideal.dimension() < 0
+
+
+def compute_all(doc):
+    nverts = doc['NVERTS']
+    dresverts = doc['DRESVERTS']
+    rescws = doc['RESCWS']
+    triang = doc['TRIANG']
+    invol = doc['INVOL']
+    oplanes = doc['OPLANES']
+    volformparity = doc['VOLFORMPARITY']
+    smooth = doc['SMOOTH']
+    
+    k = dresverts.shape[0]
+    
+    prev_R = build_ring(k, start=1)
+    curr_R = build_ring(k, start=0)
+    
+    P_monoms = compute_monomials(curr_R, nverts, dresverts)
+    srideal = compute_srideal(curr_R, triang)
+    
+    prev_fixed_loci = format_oplanes(prev_R, curr_R, oplanes)
+    curr_fixed_loci = compute_fixed_loci(curr_R, P_monoms, srideal, invol)
+    fixed_loci = {'prev': prev_fixed_loci, 'curr': curr_fixed_loci}
+    
+    prev_oplanes = [{'ODIM': compute_odim(x), 'OIDEAL': [str(x) for x in sorted(x.gens())]} for x in prev_fixed_loci]
+    curr_oplanes = [{'ODIM': compute_odim(x), 'OIDEAL': [str(x) for x in sorted(x.gens())]} for x in curr_fixed_loci]
+    oplanes = {'prev': sorted(prev_oplanes, key=lambda x: x['OIDEAL']), 'curr': sorted(curr_oplanes, key=lambda x: x['OIDEAL'])}
+    
+    prev_volformparity = volformparity
+    curr_volformparity = compute_volformparity(rescws, invol)
+    volformparity = {'prev': prev_volformparity, 'curr': curr_volformparity}
+    
+    prev_smooth = smooth
+    curr_smooth = compute_smoothness(curr_R, P_monoms, curr_fixed_loci, srideal)
+    smooth = {'prev': prev_smooth, 'curr': curr_smooth}
+    
+    return {'H11': doc['H11'],
+            'POLYID': doc['POLYID'],
+            'GEOMN': doc['GEOMN'],
+            'TRIANGN': doc['TRIANGN'],
+            'INVOLN': doc['INVOLN'],
+            'INVOL': invol.cyclic_form,
+            'SRIDEAL': [[str(y) for y in x.gens()] for x in sorted(srideal)],
+            'OPLANES': oplanes,
+            'VOLFORMPARITY': volformparity,
+            'SMOOTH': smooth}
+
+
 # CLI
 def parse_args():
     """Build argument parser"""
-    parser = ArgumentParser(description='Comparison of new method to existing db')
-    parser.add_argument('--uri',
-                        default=os.getenv('MONGO_URI'),
-                        help='Mongo database URI')
-    parser.add_argument('--query', '-q', default=None,
-                        help=f'Query [{__file__} --query "H11=int(3),VOLFORMPARITY=int(-1)"]')
-    args = parser.parse_args()
+    parent_parser = ArgumentParser(description='Comparison of new method to existing db')
+    parent_parser.add_argument('--uri',
+                               default=os.getenv('MONGO_URI'),
+                               help='Mongo database URI')
+    parent_parser.add_argument('--query', '-q', default=None,
+                               help=f'Query [{__file__} --query "H11=int(3),VOLFORMPARITY=int(-1)"]')
+    subparsers = parent_parser.add_subparsers(dest="subcommand")
+    sample_parser = subparsers.add_parser('sample')
+    full_parser = subparsers.add_parser('full')
+    args = parent_parser.parse_args()
     if args.query:
         args.query = dict(x.split('=') for x in args.query.split(','))
         for k in args.query:
@@ -172,48 +287,36 @@ def parse_args():
     return args
 
 
-def sample_format_inputs(query, uri=os.getenv('MONGO_URI')):
-    db = ToricCY(uri)
-    result = db.sample_join(query)
-    
-    result['NVERTS'] = format_matrix(result['NVERTS'])
-    result['DRESVERTS'] = format_matrix(result['DRESVERTS'])
-    result['RESCWS'] = format_matrix(result['RESCWS'])
-    result['TRIANG'] = format_matrix(result['TRIANG'])
-    
-    k, n = result['DRESVERTS'].shape
-    result['INVOL'] = format_invol(result['INVOL'], k)
-    
-    return result
-
-
 if __name__ == '__main__':
     args = parse_args()
-    result = sample_format_inputs(args.query, args.uri)
     
-    k = result['DRESVERTS'].shape[0]
+    db = ToricCY(args.uri)
     
-    prev_R = build_ring(k, start=1)
-    curr_R = build_ring(k, start=0)
-    
-    P_monoms = compute_monomials(curr_R, result['NVERTS'], result['DRESVERTS'])
-    srideal = compute_srideal(curr_R, result['TRIANG'])
-    
-    prev_fixed_loci = format_oplanes(prev_R, curr_R, result['OPLANES'])
-    curr_fixed_loci = compute_fixed_loci(curr_R, P_monoms, srideal, result['INVOL'])
-    
-    prev_oplanes = [(compute_odim(x), x.gens()) for x in prev_fixed_loci]
-    curr_oplanes = [(compute_odim(x), x.gens()) for x in curr_fixed_loci]
-    
-    ids = ['H11', 'POLYID', 'GEOMN', 'TRIANGN', 'INVOLN']
-    print('Query:', {x: result[x] for x in ids})
-    print('')
-    print('Involution:', result['INVOL'])
-    print('')
-    print('Stanley-Reisner ideal:')
-    print('\t', 'Previous:', [x.gens() for x in format_srideal(prev_R, curr_R, result['SRIDEAL'])])
-    print('\t', 'Current:', [x.gens() for x in srideal])
-    print('')
-    print('Fixed loci:')
-    print('\t', 'Previous:', prev_oplanes)
-    print('\t', 'Current:', curr_oplanes)
+    if args.subcommand == 'sample':
+        doc = db.sample_join(args.query)
+        doc = format_inputs(doc)
+        result = compute_all(doc)
+
+        ids = ['H11', 'POLYID', 'GEOMN', 'TRIANGN', 'INVOLN']
+        print('Query:', {x: result[x] for x in ids})
+        print('')
+        print('Involution:', result['INVOL'])
+        print('')
+        print('Stanley-Reisner ideal:', result['SRIDEAL'])
+        print('')
+        print('Fixed loci:')
+        print('\t', 'Previous:', result['OPLANES']['prev'])
+        print('\t', 'Current:', result['OPLANES']['curr'])
+        print('')
+        print('Volume Form Parity:')
+        print('\t', 'Previous:', result['VOLFORMPARITY']['prev'])
+        print('\t', 'Current:', result['VOLFORMPARITY']['curr'])
+        print('')
+        print('Smoothness:')
+        print('\t', 'Previous:', result['SMOOTH']['prev'])
+        print('\t', 'Current:', result['SMOOTH']['curr'])
+    elif args.subcommand == 'full':
+        for doc in tqdm(db.full_join(args.query), total=db.count(args.query)):
+            doc = format_inputs(doc)
+            result = compute_all(doc)
+            print(result)
