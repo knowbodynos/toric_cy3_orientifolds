@@ -5,6 +5,7 @@
     a. For MacOS, you can install it via: https://github.com/3-manifolds/Sage_macOS/releases
 2. PyMongo: `sage -pip install pymongo`
 3. SymPy: `sage -pip install sympy`
+4. python-dotenv: `sage -pip python-dotenv`
 
 ## Usage
 Set the environment variable `MONGO_URI` to the URI of a local or remote MongoDB database.
