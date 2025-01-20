@@ -1,4 +1,5 @@
 # toric_cy3_orientifolds
+Scripts for computing toric Calabi-Yau 3-fold orientifolds
 
 ## Requirements
 1. Sage with OpenSSL enabled for installing external python packages
